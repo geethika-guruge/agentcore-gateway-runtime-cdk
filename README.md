@@ -1,159 +1,138 @@
-# M2M Auth Gateway - CDK Deployment Guide
+# BedrockAgentCore Gateway with M2M OAuth Authentication (CDK)
 
-Python CDK stack deploying AgentCore Gateway with M2M OAuth authentication.
+AWS CDK implementation of BedrockAgentCore Gateway demonstrating Machine-to-Machine (M2M) OAuth authentication pattern.
 
 ## Architecture
 
 ```
-User → Cognito A (JWT) → Gateway → Cognito B (OAuth M2M) → MCP Server Runtime (ECR)
+User → Gateway (JWT Inbound Auth) → MCP Server Runtime (OAuth M2M Outbound Auth)
 ```
 
-- **Inbound**: Cognito User Pool with JWT authentication
-- **Outbound**: Cognito User Pool with OAuth2 client_credentials grant
-- **Gateway**: AgentCore Gateway (MCP protocol)
-- **Runtime**: AgentCore Runtime hosting containerized MCP Server
+- **Inbound Authentication**: User authenticates with Cognito User Pool A, receives JWT token
+- **Gateway**: Validates user JWT, forwards requests to MCP Server
+- **Outbound Authentication**: Gateway uses OAuth2 client_credentials flow with Cognito User Pool B to authenticate with MCP Server
+- **MCP Server Runtime**: Validates OAuth token, executes MCP tools
 
----
+## Project Structure
+
+```
+.
+├── app.py                      # Base stack CDK app
+├── app_runtime.py              # Runtime stack CDK app
+├── base_stack.py               # Base infrastructure (ECR, Cognito, IAM)
+├── runtime_stack.py            # Runtime resources (AgentRuntime, Gateway, OAuth2Provider)
+├── deploy_base.sh              # Deploy base infrastructure and Docker image
+├── deploy_runtime.sh           # Deploy runtime stack
+├── docker-image/               # MCP Server Docker image source
+├── lambda/
+│   ├── oauth_provider_handler.py      # OAuth2 credential provider custom resource
+│   └── gateway_target_handler.py      # GatewayTarget custom resource (unused)
+└── cdk.json                    # CDK configuration
+```
 
 ## Prerequisites
 
-- AWS CLI configured with credentials
-- Python 3.8+
+- AWS CLI configured
+- AWS CDK CLI installed
 - Docker with buildx support
-- AWS CDK CLI: `npm install -g aws-cdk`
+- Python 3.9+
+- Node.js (for CDK)
 
----
+## Deployment
 
-## Deployment Steps
-
-### 1. Setup Python Environment
+### 1. Deploy Base Infrastructure
 
 ```bash
 cd gateway-runtime
 python3 -m venv .venv
-source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+source .venv/bin/activate
 pip install -r requirements.txt
+
+# Deploy base stack (ECR, Cognito, IAM) and push Docker image
+./deploy_base.sh
 ```
 
-### 2. Bootstrap CDK (First Time Only)
+This will:
+- Create ECR repository
+- Create Cognito User Pools (inbound and outbound)
+- Create IAM roles with ECR permissions
+- Build and push Docker image to ECR
+
+### 2. Deploy Runtime Stack
 
 ```bash
-cdk bootstrap aws://ACCOUNT-ID/ap-southeast-2
+# Deploy runtime stack (AgentRuntime, Gateway, OAuth2Provider)
+./deploy_runtime.sh
 ```
 
-### 3. Initial Deploy (Creates ECR Repository)
+This will:
+- Create OAuth2 Credential Provider
+- Deploy AgentRuntime with MCP Server
+- Create Gateway with JWT authentication
+- Attempt to create GatewayTarget (currently fails - see Known Issues)
 
-```bash
-cdk deploy
-```
+## Stack Outputs
 
-**Note**: This will fail at the AgentRuntime resource because the ECR image doesn't exist yet. This is expected.
+### Base Stack
+- `ECRRepositoryUri`: Docker image repository
+- `InboundUserPoolId`: User authentication pool
+- `InboundClientId`: User authentication client
+- `OutboundUserPoolId`: M2M authentication pool
+- `M2MClientId`: M2M client credentials
+- `RuntimeRoleArn`: Runtime IAM role
+- `GatewayRoleArn`: Gateway IAM role
 
-### 4. Build and Push Docker Image
-
-After the initial deploy creates the ECR repository:
-
-```bash
-# Get ECR repository URI from stack outputs
-export ECR_URI=$(aws cloudformation describe-stacks \
-  --stack-name M2MAuthGatewayStack \
-  --query 'Stacks[0].Outputs[?OutputKey==`ECRRepositoryUri`].OutputValue' \
-  --output text \
-  --region ap-southeast-2)
-
-# Login to ECR
-aws ecr get-login-password --region ap-southeast-2 | \
-  docker login --username AWS --password-stdin $ECR_URI
-
-# Build and push (from parent directory containing agent/ folder)
-cd ../agentcore-gateway-runtime-m2m-auth-demo/agent
-docker buildx build --platform linux/arm64 -t ${ECR_URI}:latest --push .
-```
-
-### 5. Complete Deployment
-
-```bash
-cd ../../gateway-runtime
-cdk deploy
-```
-
-This will successfully create all resources including the AgentRuntime.
-
----
+### Runtime Stack
+- `RuntimeArn`: AgentRuntime identifier
+- `GatewayId`: Gateway identifier
+- `OAuth2ProviderArn`: OAuth credential provider ARN
 
 ## Configuration
 
 Edit `cdk.json` to customize:
+- `project_name`: Project prefix (default: m2m-auth-demo)
+- `region`: AWS region (default: ap-southeast-2)
 
-```json
-{
-  "context": {
-    "project_name": "m2m-auth-demo",
-    "region": "ap-southeast-2"
-  }
-}
+## Known Issues
+
+### GatewayTarget Deployment
+
+The GatewayTarget resource cannot be deployed via CDK due to a CloudFormation validation issue when including OAuth credential provider configuration:
+
+**Issue**: CloudFormation Early Validation fails when `credential_provider_configurations` includes OAuth scopes
+**Workaround**: Deploy without GatewayTarget, or use Terraform (see [terraform implementation](https://github.com/geethika-guruge/agentcore-gateway-runtime-m2m-auth-demo))
+
+**Error**:
+```
+FAILED, The following hook(s)/validation failed: [AWS::EarlyValidation::PropertyValidation]
 ```
 
----
+This appears to be a BedrockAgentCore preview service limitation where OAuth credential provider configuration isn't fully supported in CloudFormation yet.
 
-## Stack Outputs
+## Cognito Scopes
 
-After successful deployment:
-
-| Output | Description |
-|--------|-------------|
-| `InboundUserPoolId` | Cognito pool for user authentication |
-| `InboundClientId` | Client ID for user login |
-| `OutboundUserPoolId` | Cognito pool for M2M authentication |
-| `M2MClientId` | Client ID for gateway→runtime auth |
-| `ECRRepositoryUri` | Container registry URI |
-| `GatewayId` | AgentCore Gateway identifier |
-
----
-
-## Testing
-
-### Create Test User
-
-```bash
-aws cognito-idp admin-create-user \
-  --user-pool-id <InboundUserPoolId> \
-  --username testuser \
-  --user-attributes Name=email,Value=test@example.com \
-  --temporary-password TempPass123! \
-  --region ap-southeast-2
-```
-
-### Get User Token
-
-```bash
-aws cognito-idp admin-initiate-auth \
-  --user-pool-id <InboundUserPoolId> \
-  --client-id <InboundClientId> \
-  --auth-flow ADMIN_USER_PASSWORD_AUTH \
-  --auth-parameters USERNAME=testuser,PASSWORD=<password> \
-  --region ap-southeast-2
-```
-
----
+The outbound Cognito User Pool defines three scopes for MCP server access:
+- `mcp-server/tools.read`: Read tools from MCP server
+- `mcp-server/tools.write`: Write tools to MCP server
+- `mcp-server/tools.execute`: Execute tools on MCP server
 
 ## Cleanup
 
 ```bash
-cdk destroy
+# Delete runtime stack
+aws cloudformation delete-stack --stack-name M2MAuthRuntimeStack --region ap-southeast-2
+
+# Delete base stack (will also delete ECR images)
+aws cloudformation delete-stack --stack-name M2MAuthBaseStack --region ap-southeast-2
 ```
 
-**Note**: ECR repository is configured with `empty_on_delete=True` for automatic cleanup.
+## Comparison with Terraform
 
----
+A working Terraform implementation is available at:
+https://github.com/geethika-guruge/agentcore-gateway-runtime-m2m-auth-demo
 
-## Troubleshooting
+The Terraform version successfully deploys all resources including GatewayTarget with OAuth credentials.
 
-**Issue**: AgentRuntime creation fails  
-**Solution**: Ensure Docker image is pushed to ECR before final deployment
+## License
 
-**Issue**: Docker build fails  
-**Solution**: Verify `agent/` directory exists with Dockerfile, mcp_server.py, requirements.txt
-
-**Issue**: Authentication errors  
-**Solution**: Check Cognito client IDs match in authorizer configurations
+MIT
