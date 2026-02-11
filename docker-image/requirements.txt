@@ -1,0 +1,8 @@
+# MCP Server Dependencies
+# For AgentCore Runtime deployment
+
+# MCP SDK (required for FastMCP server)
+mcp
+
+# Starlette (required for FastMCP HTTP transport)
+starlette

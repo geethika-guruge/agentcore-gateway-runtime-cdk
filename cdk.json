@@ -1,0 +1,9 @@
+{
+  "app": "python3 app.py",
+  "context": {
+    "project_name": "m2m-auth-demo",
+    "region": "ap-southeast-2",
+    "aws-cdk:enableDiffNoFail": true,
+    "@aws-cdk/core:stackRelativeExports": true
+  }
+}
