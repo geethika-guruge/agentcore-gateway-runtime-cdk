@@ -67,6 +67,7 @@ This will:
 
 This will:
 - Create OAuth2 Credential Provider
+- Create Workload Identity for Gateway
 - Deploy AgentRuntime with MCP Server
 - Create Gateway with JWT authentication
 - Attempt to create GatewayTarget (currently fails - see Known Issues)

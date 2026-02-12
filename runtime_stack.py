@@ -58,6 +58,14 @@ class RuntimeStack(Stack):
 
         oauth_provider_arn = oauth_provider.get_att_string("CredentialProviderArn")
 
+        # Workload Identity for Gateway
+        workload_identity = agentcore.CfnWorkloadIdentity(
+            self,
+            "WorkloadIdentity",
+            name=f"{project_name}-gateway-identity",
+            allowed_resource_oauth2_return_urls=["https://localhost/callback", "https://localhost:3000/callback"],
+        )
+
         # Agent Runtime
         agent_runtime = agentcore.CfnRuntime(
             self,
