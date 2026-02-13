@@ -1,9 +1,8 @@
 # mcp_server.py
 
 from mcp.server.fastmcp import FastMCP
-from starlette.responses import JSONResponse
 
-mcp = FastMCP(host="0.0.0.0", stateless_http=True)
+mcp = FastMCP(host="0.0.0.0", port=8000, stateless_http=True)
 
 @mcp.tool()
 def add_numbers(a: int, b: int) -> int:

@@ -1,37 +1,21 @@
 import os
+import json
 import aws_cdk as cdk
 from aws_cdk import (
     aws_iam as iam,
     aws_cognito as cognito,
     aws_ecr as ecr,
+    aws_bedrockagentcore as bedrockagentcore,
     custom_resources as cr,
-)
-from aws_cdk.aws_bedrock_agentcore_alpha import (
-    AgentRuntimeArtifact,
-    Runtime,
-    RuntimeAuthorizerConfiguration,
-    ProtocolType,
-    Gateway,
-    GatewayAuthorizer,
-    GatewayCredentialProvider,
 )
 from constructs import Construct
 
 
-class AgentCoreMCPDemoStack(cdk.Stack):
-    def __init__(self, scope: Construct, construct_id: str, **kwargs) -> None:
+class AgentCoreMCPDemoL1Stack(cdk.Stack):
+    def __init__(self, scope: Construct, construct_id: str, ecr_repository: ecr.Repository, **kwargs) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
-        stack_name = "agentcore-mcp-demo"
-
-        # ECR Repository
-        ecr_repo = ecr.Repository(
-            self,
-            "MCPServerRepo",
-            repository_name=f"{stack_name}-mcp-server",
-            removal_policy=cdk.RemovalPolicy.DESTROY,
-            empty_on_delete=True,
-        )
+        stack_name = "agentcore-mcp-demo-l1"
 
         # IAM Role for Runtime
         runtime_role = iam.Role(
@@ -54,7 +38,7 @@ class AgentCoreMCPDemoStack(cdk.Stack):
         runtime_role.add_to_policy(
             iam.PolicyStatement(
                 actions=["ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer"],
-                resources=[ecr_repo.repository_arn],
+                resources=[ecr_repository.repository_arn],
             )
         )
 
@@ -117,113 +101,97 @@ class AgentCoreMCPDemoStack(cdk.Stack):
             ),
         )
 
-        # Gateway
-        gateway = Gateway(
+        # Gateway (L1)
+        gateway = bedrockagentcore.CfnGateway(
             self,
             "Gateway",
-            gateway_name=f"{stack_name}-gateway",
-            authorizer_configuration=GatewayAuthorizer.using_cognito(
-                user_pool=inbound_pool,
-                allowed_clients=[inbound_client]
+            name=f"{stack_name}-gateway",
+            authorizer_type="CUSTOM_JWT",
+            protocol_type="MCP",
+            role_arn=runtime_role.role_arn,
+            authorizer_configuration=bedrockagentcore.CfnGateway.AuthorizerConfigurationProperty(
+                custom_jwt_authorizer=bedrockagentcore.CfnGateway.CustomJWTAuthorizerConfigurationProperty(
+                    discovery_url=f"https://cognito-idp.{self.region}.amazonaws.com/{inbound_pool.user_pool_id}/.well-known/openid-configuration",
+                    allowed_clients=[inbound_client.user_pool_client_id],
+                )
+            ),
+            protocol_configuration=bedrockagentcore.CfnGateway.GatewayProtocolConfigurationProperty(
+                mcp=bedrockagentcore.CfnGateway.MCPGatewayConfigurationProperty(
+                    supported_versions=["2025-03-26"]
+                )
             ),
         )
 
-        # MCP Runtime
-        mcp_runtime_artifact = AgentRuntimeArtifact.from_asset(
-            os.path.join(os.path.dirname(__file__), "docker-image")
-        )
-
-        mcp_runtime = Runtime(
+        # Build and push Docker image using custom resource
+        docker_build = cr.AwsCustomResource(
             self,
-            "MCPRuntime",
-            runtime_name=f"{stack_name.replace('-', '_')}_mcp_server",
-            execution_role=runtime_role,
-            agent_runtime_artifact=mcp_runtime_artifact,
-            protocol_configuration=ProtocolType.MCP,
-            authorizer_configuration=RuntimeAuthorizerConfiguration.using_cognito(
-                outbound_pool, [m2m_client],
-            ),
-        )
-
-        # OAuth2 Credential Provider
-        oauth_provider_name = f"{stack_name}-oauth-provider"
-        oauth_provider = cr.AwsCustomResource(
-            self,
-            "OAuthCredentialProvider",
-            install_latest_aws_sdk=True,
+            "DockerBuild",
+            install_latest_aws_sdk=False,
             on_create=cr.AwsSdkCall(
-                service="@aws-sdk/client-bedrock-agentcore-control",
-                action="CreateOauth2CredentialProvider",
-                parameters={
-                    "name": oauth_provider_name,
-                    "credentialProviderVendor": "CustomOauth2",
-                    "oauth2ProviderConfigInput": {
-                        "customOauth2ProviderConfig": {
-                            "oauthDiscovery": {
-                                "discoveryUrl": f"https://cognito-idp.{self.region}.amazonaws.com/{outbound_pool.user_pool_id}/.well-known/openid-configuration",
-                            },
-                            "clientId": m2m_client.user_pool_client_id,
-                            "clientSecret": m2m_client.user_pool_client_secret.unsafe_unwrap(),
-                        },
-                    },
-                },
-                physical_resource_id=cr.PhysicalResourceId.from_response("credentialProviderArn"),
-            ),
-            on_delete=cr.AwsSdkCall(
-                service="@aws-sdk/client-bedrock-agentcore-control",
-                action="DeleteOauth2CredentialProvider",
-                parameters={
-                    "name": oauth_provider_name,
-                },
+                service="ecr",
+                action="getAuthorizationToken",
+                physical_resource_id=cr.PhysicalResourceId.of("docker-build-trigger"),
             ),
             policy=cr.AwsCustomResourcePolicy.from_statements([
                 iam.PolicyStatement(
-                    actions=[
-                        "bedrock-agentcore:CreateTokenVault",
-                        "bedrock-agentcore:GetTokenVault",
-                        "bedrock-agentcore:CreateOauth2CredentialProvider",
-                        "bedrock-agentcore:DeleteOauth2CredentialProvider",
-                        "secretsmanager:CreateSecret",
-                        "secretsmanager:DeleteSecret",
-                    ],
+                    actions=["ecr:GetAuthorizationToken"],
                     resources=["*"],
                 ),
             ]),
         )
 
-        provider_arn = oauth_provider.get_response_field("credentialProviderArn")
-        secret_arn = oauth_provider.get_response_field("clientSecretArn.secretArn")
+        # MCP Runtime (L1)
+        mcp_runtime = bedrockagentcore.CfnRuntime(
+            self,
+            "MCPRuntime",
+            agent_runtime_name=f"{stack_name.replace('-', '_')}_mcp_server",
+            role_arn=runtime_role.role_arn,
+            agent_runtime_artifact=bedrockagentcore.CfnRuntime.AgentRuntimeArtifactProperty(
+                container_configuration=bedrockagentcore.CfnRuntime.ContainerConfigurationProperty(
+                    container_uri=f"{ecr_repository.repository_uri}:latest",
+                )
+            ),
+            network_configuration=bedrockagentcore.CfnRuntime.NetworkConfigurationProperty(
+                network_mode="PUBLIC",
+            ),
+        )
+        mcp_runtime.node.add_dependency(docker_build)
+
+        # OAuth2 Credential Provider - DISABLED FOR NOW
+        # oauth_provider_name = f"{stack_name}-oauth-provider"
+        # oauth_provider = cr.AwsCustomResource(...)
 
         # URL-encode the runtime ARN for the endpoint
         escaped_arn = cdk.Fn.join("%2F", cdk.Fn.split("/",
-            cdk.Fn.join("%3A", cdk.Fn.split(":", mcp_runtime.agent_runtime_arn))
+            cdk.Fn.join("%3A", cdk.Fn.split(":", mcp_runtime.attr_agent_runtime_arn))
         ))
         mcp_runtime_endpoint = f"https://bedrock-agentcore.{self.region}.amazonaws.com/runtimes/{escaped_arn}/invocations?qualifier=DEFAULT"
 
-        # Gateway Target
-        gateway.add_mcp_server_target(
-            "MCPTarget",
-            gateway_target_name=f"{stack_name}-mcp-target",
-            description="MCP Server with M2M OAuth authentication",
-            endpoint=mcp_runtime_endpoint,
-            credential_provider_configurations=[
-                GatewayCredentialProvider.from_oauth_identity_arn(
-                    provider_arn=provider_arn,
-                    secret_arn=secret_arn,
-                    scopes=["mcp-server/tools.execute"],
-                ),
-            ],
-        )
+        # Gateway Target (L1) - COMMENTED OUT - Connection issues with L1 constructs
+        # gateway_target = bedrockagentcore.CfnGatewayTarget(
+        #     self,
+        #     "MCPTarget",
+        #     name=f"{stack_name}-mcp-target",
+        #     gateway_identifier=gateway.attr_gateway_identifier,
+        #     description="MCP Server without authentication",
+        #     target_configuration=bedrockagentcore.CfnGatewayTarget.TargetConfigurationProperty(
+        #         mcp=bedrockagentcore.CfnGatewayTarget.McpTargetConfigurationProperty(
+        #             mcp_server=bedrockagentcore.CfnGatewayTarget.McpServerTargetConfigurationProperty(
+        #                 endpoint=mcp_runtime_endpoint,
+        #             )
+        #         )
+        #     ),
+        # )
 
         # Outputs
-        cdk.CfnOutput(self, "ECRRepositoryUri", value=ecr_repo.repository_uri)
+        cdk.CfnOutput(self, "ECRRepositoryUri", value=ecr_repository.repository_uri)
         cdk.CfnOutput(self, "InboundUserPoolId", value=inbound_pool.user_pool_id)
         cdk.CfnOutput(self, "InboundClientId", value=inbound_client.user_pool_client_id)
         cdk.CfnOutput(self, "OutboundUserPoolId", value=outbound_pool.user_pool_id)
         cdk.CfnOutput(self, "M2MClientId", value=m2m_client.user_pool_client_id)
-        cdk.CfnOutput(self, "GatewayId", value=gateway.gateway_id)
-        cdk.CfnOutput(self, "GatewayUrl", value=gateway.gateway_url)
-        cdk.CfnOutput(self, "RuntimeArn", value=mcp_runtime.agent_runtime_arn)
-        cdk.CfnOutput(self, "OAuthProviderArn", value=provider_arn)
+        cdk.CfnOutput(self, "GatewayId", value=gateway.attr_gateway_identifier)
+        cdk.CfnOutput(self, "GatewayUrl", value=gateway.attr_gateway_url)
+        cdk.CfnOutput(self, "RuntimeArn", value=mcp_runtime.attr_agent_runtime_arn)
+        # cdk.CfnOutput(self, "OAuthProviderArn", value=provider_arn)  # DISABLED
         cdk.CfnOutput(self, "InboundTokenEndpoint", value=f"{inbound_domain.base_url()}/oauth2/token")
         cdk.CfnOutput(self, "OutboundTokenEndpoint", value=f"{outbound_domain.base_url()}/oauth2/token")
